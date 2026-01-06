@@ -35,6 +35,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc as tokio_mpsc;
 
 /// Runs `runst`.
 pub fn run() -> Result<()> {
@@ -73,16 +74,51 @@ pub fn run() -> Result<()> {
             window_cloned,
             notifications_cloned,
             config_cloned,
-            move |notification| {
-                debug!("user input detected");
-                sender_cloned
-                    .send(Action::Close(Some(notification.id)))
-                    .expect("failed to send close action");
+            move |clicked_notifications, clicked_idx, invoke_action| {
+                // Handle the specific clicked notification, or first if click location unknown
+                let notification = clicked_idx
+                    .and_then(|idx| clicked_notifications.get(idx))
+                    .or_else(|| clicked_notifications.first());
+
+                if let Some(notification) = notification {
+                    debug!(
+                        "user clicked - handling notification id={} app={} (clicked_idx={:?}, invoke={})",
+                        notification.id, notification.app_name, clicked_idx, invoke_action
+                    );
+
+                    // Only invoke action if not clicking the close button
+                    if invoke_action {
+                        // Actions are [key, label, key, label, ...]
+                        // Look for "default" action first, otherwise use first action
+                        let action_key = if notification.actions.contains(&"default".to_string()) {
+                            Some("default".to_string())
+                        } else {
+                            notification.actions.first().cloned()
+                        };
+                        if let Some(key) = action_key {
+                            debug!("invoking action '{}' for notification {}", key, notification.id);
+                            sender_cloned
+                                .send(Action::Invoke(notification.id, key))
+                                .expect("failed to send invoke action");
+                        }
+                    } else {
+                        debug!("close button clicked - not invoking action");
+                    }
+
+                    // Close this notification
+                    sender_cloned
+                        .send(Action::Close(Some(notification.id)))
+                        .expect("failed to send close action");
+                }
             },
         ) {
             eprintln!("Failed to handle X11 events: {e}")
         }
     });
+
+    // Create channel for action invocations (to emit D-Bus signals)
+    let (invoke_tx, mut invoke_rx) = tokio_mpsc::unbounded_channel::<(u32, String)>();
+    let invoke_sender = Arc::new(invoke_tx);
 
     // Spawn zbus D-Bus server thread
     let sender_for_zbus = sender.clone();
@@ -129,8 +165,27 @@ pub fn run() -> Result<()> {
                             }
 
                             info!("Z-Bus server is running");
-                            // Keep the connection alive
-                            std::future::pending::<()>().await;
+
+                            // Listen for action invocations and emit signals
+                            while let Some((id, action_key)) = invoke_rx.recv().await {
+                                debug!(
+                                    "emitting ActionInvoked signal: id={}, action={}",
+                                    id, action_key
+                                );
+                                // Emit ActionInvoked signal directly
+                                if let Err(e) = connection
+                                    .emit_signal(
+                                        None::<&str>,
+                                        "/org/freedesktop/Notifications",
+                                        "org.freedesktop.Notifications",
+                                        "ActionInvoked",
+                                        &(id, &action_key),
+                                    )
+                                    .await
+                                {
+                                    log::warn!("failed to emit ActionInvoked signal: {}", e);
+                                }
+                            }
                         }
                         Err(e) => {
                             eprintln!("Failed to build zbus connection: {}", e);
@@ -160,6 +215,7 @@ pub fn run() -> Result<()> {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            actions: Vec::new(),
         };
         sender.send(Action::Show(startup_notification))?;
     }
@@ -168,7 +224,15 @@ pub fn run() -> Result<()> {
     loop {
         match receiver.recv()? {
             Action::Show(notification) => {
-                debug!("received notification: {}", notification.id);
+                info!(
+                    "notification received: id={} app=\"{}\" urgency={} timeout={:?} summary=\"{}\" body=\"{}\"",
+                    notification.id,
+                    notification.app_name,
+                    notification.urgency,
+                    notification.expire_timeout,
+                    notification.summary,
+                    notification.body.replace('\n', "\\n")
+                );
 
                 // Save to persistent history
                 {
@@ -252,6 +316,13 @@ pub fn run() -> Result<()> {
                 debug!("closing all notifications");
                 notifications.mark_all_as_read();
                 x11_cloned.hide_window(&window)?;
+            }
+            Action::Invoke(id, action_key) => {
+                debug!("invoking action '{}' on notification {}", action_key, id);
+                // Send to zbus thread to emit ActionInvoked signal
+                if let Err(e) = invoke_sender.send((id, action_key)) {
+                    log::warn!("failed to send action invocation: {}", e);
+                }
             }
         }
     }

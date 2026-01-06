@@ -7,6 +7,7 @@ use serde::de::{Deserializer, Error as SerdeError};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use sscanf::scanf;
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -78,6 +79,89 @@ pub struct Config {
     pub urgency_normal: UrgencyConfig,
     /// Configuration for critical urgency.
     pub urgency_critical: UrgencyConfig,
+    /// Color mapping for specific applications (app_name -> hex color).
+    #[serde(default)]
+    pub app_colors: HashMap<String, String>,
+    /// Notification styling rules based on patterns.
+    #[serde(default)]
+    pub rules: Vec<NotificationRule>,
+}
+
+/// A rule for styling notifications based on patterns.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NotificationRule {
+    /// Pattern to match against app_name (glob-style with *).
+    #[serde(default)]
+    pub app_name: Option<String>,
+    /// Pattern to match against summary (glob-style with *).
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Pattern to match against body (glob-style with *).
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Foreground color to use for matching notifications.
+    #[serde(default)]
+    pub foreground: Option<String>,
+    /// Background color to use for matching notifications.
+    #[serde(default)]
+    pub background: Option<String>,
+}
+
+/// Checks if a value matches a glob-style pattern (case-insensitive).
+/// Supports `*` as wildcard.
+pub fn glob_match(pattern: &str, value: &str) -> bool {
+    let pattern_lower = pattern.to_lowercase();
+    let value_lower = value.to_lowercase();
+
+    if !pattern_lower.contains('*') {
+        return pattern_lower == value_lower;
+    }
+
+    let parts: Vec<&str> = pattern_lower.split('*').collect();
+
+    match parts.as_slice() {
+        ["", suffix] => value_lower.ends_with(suffix),
+        [prefix, ""] => value_lower.starts_with(prefix),
+        [prefix, suffix] => value_lower.starts_with(prefix) && value_lower.ends_with(suffix),
+        ["", middle, ""] => value_lower.contains(middle),
+        _ => {
+            let mut remaining = value_lower.as_str();
+            for part in &parts {
+                if part.is_empty() {
+                    continue;
+                }
+                if let Some(pos) = remaining.find(part) {
+                    remaining = &remaining[pos + part.len()..];
+                } else {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+impl NotificationRule {
+    /// Checks if this rule matches the given notification.
+    pub fn matches(&self, app_name: &str, summary: &str, body: &str) -> bool {
+        // All specified patterns must match
+        if let Some(ref pattern) = self.app_name
+            && !glob_match(pattern, app_name)
+        {
+            return false;
+        }
+        if let Some(ref pattern) = self.summary
+            && !glob_match(pattern, summary)
+        {
+            return false;
+        }
+        if let Some(ref pattern) = self.body
+            && !glob_match(pattern, body)
+        {
+            return false;
+        }
+        true
+    }
 }
 
 impl Config {
@@ -118,6 +202,37 @@ impl Config {
             Urgency::Critical => self.urgency_critical.clone(),
         }
     }
+
+    /// Returns the color for a specific application, if configured.
+    /// Supports glob-style patterns with `*` as a wildcard.
+    /// Examples: "Claude*" matches "Claude Code", "*bash*" matches "my-bash-script"
+    pub fn get_app_color(&self, app_name: &str) -> Option<&String> {
+        // First try exact match
+        if let Some(color) = self.app_colors.get(app_name) {
+            return Some(color);
+        }
+
+        // Then try pattern matching
+        for (pattern, color) in &self.app_colors {
+            if glob_match(pattern, app_name) {
+                return Some(color);
+            }
+        }
+
+        None
+    }
+
+    /// Returns the first matching rule for a notification, if any.
+    pub fn get_matching_rule(
+        &self,
+        app_name: &str,
+        summary: &str,
+        body: &str,
+    ) -> Option<&NotificationRule> {
+        self.rules
+            .iter()
+            .find(|rule| rule.matches(app_name, summary, body))
+    }
 }
 
 /// Global configuration.
@@ -146,6 +261,17 @@ pub struct GlobalConfig {
     /// Set to 0 for unlimited.
     #[serde(default)]
     pub display_limit: usize,
+    /// Minimum window width in pixels. If not set, window sizes to content.
+    #[serde(default)]
+    pub min_width: Option<u32>,
+    /// Refresh interval in milliseconds for updating the age counter.
+    /// Set to 0 to disable periodic refresh. Default is 1000 (1 second).
+    #[serde(default = "default_refresh_interval")]
+    pub refresh_interval_ms: u64,
+}
+
+fn default_refresh_interval() -> u64 {
+    1000
 }
 
 /// Custom deserializer implementation for converting `String` to [`LevelFilter`]

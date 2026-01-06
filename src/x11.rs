@@ -171,6 +171,7 @@ impl X11 {
         let context = CairoContext::new(&surface)?;
         X11Window::new(
             window_id,
+            surface,
             context,
             &config.font,
             Box::leak(config.template.to_string().into_boxed_str()),
@@ -210,7 +211,12 @@ impl X11 {
         Ok(())
     }
 
-    /// Handles the events.
+    /// Width of the close button area on the right side of each notification.
+    const CLOSE_BUTTON_WIDTH: i32 = 30;
+
+    /// Handles X11 events in a loop, calling `on_press` when a notification is clicked.
+    /// The callback receives (notifications, clicked_index, invoke_action) where
+    /// invoke_action is false if the close button was clicked.
     pub fn handle_events<F>(
         &self,
         window: Arc<X11Window>,
@@ -219,29 +225,79 @@ impl X11 {
         on_press: F,
     ) -> Result<()>
     where
-        F: Fn(&Notification),
+        F: Fn(Vec<Notification>, Option<usize>, bool), // (notifications, clicked_idx, invoke_action)
     {
         let display_limit = config.global.display_limit;
+        let refresh_interval = config.global.refresh_interval_ms;
+
         loop {
             self.connection.flush()?;
-            let event = self.connection.wait_for_event()?;
-            let mut event_opt = Some(event);
-            while let Some(event) = event_opt {
-                log::trace!("New event: {:?}", event);
-                match event {
-                    Event::Expose(_) => {
-                        let notifications = manager.get_unread_buffer(display_limit);
-                        let unread_count = manager.get_unread_count();
+
+            // If refresh is enabled and there are unread notifications, use polling with timeout
+            // Otherwise, block waiting for events
+            let has_unread = manager.get_unread_count() > 0;
+            let use_refresh = refresh_interval > 0 && has_unread;
+
+            if use_refresh {
+                // Non-blocking poll for events
+                let mut event_opt = self.connection.poll_for_event()?;
+
+                if event_opt.is_none() {
+                    // No events, sleep for refresh interval then redraw
+                    std::thread::sleep(Duration::from_millis(refresh_interval));
+                    let notifications = manager.get_unread_buffer(display_limit);
+                    let unread_count = manager.get_unread_count();
+                    if !notifications.is_empty() {
                         window.draw(&self.connection, notifications, unread_count, &config)?;
                     }
-                    Event::ButtonPress(_) => {
-                        let notification = manager.get_last_unread();
-                        manager.mark_last_as_read();
-                        on_press(&notification);
-                    }
-                    _ => {}
+                    continue;
                 }
-                event_opt = self.connection.poll_for_event()?;
+
+                // Process any pending events
+                while let Some(event) = event_opt {
+                    log::trace!("New event: {:?}", event);
+                    match event {
+                        Event::Expose(_) => {
+                            let notifications = manager.get_unread_buffer(display_limit);
+                            let unread_count = manager.get_unread_count();
+                            window.draw(&self.connection, notifications, unread_count, &config)?;
+                        }
+                        Event::ButtonPress(ev) => {
+                            let unread = manager.get_unread_buffer(display_limit);
+                            let clicked_idx = window.get_clicked_index(ev.event_y as i32);
+                            let window_width = window.get_window_width();
+                            let invoke_action = (ev.event_x as i32) < window_width - Self::CLOSE_BUTTON_WIDTH;
+                            // Don't mark all as read here - let callback handle individual closes
+                            on_press(unread, clicked_idx, invoke_action);
+                        }
+                        _ => {}
+                    }
+                    event_opt = self.connection.poll_for_event()?;
+                }
+            } else {
+                // Block waiting for events (original behavior)
+                let event = self.connection.wait_for_event()?;
+                let mut event_opt = Some(event);
+                while let Some(event) = event_opt {
+                    log::trace!("New event: {:?}", event);
+                    match event {
+                        Event::Expose(_) => {
+                            let notifications = manager.get_unread_buffer(display_limit);
+                            let unread_count = manager.get_unread_count();
+                            window.draw(&self.connection, notifications, unread_count, &config)?;
+                        }
+                        Event::ButtonPress(ev) => {
+                            let unread = manager.get_unread_buffer(display_limit);
+                            let clicked_idx = window.get_clicked_index(ev.event_y as i32);
+                            let window_width = window.get_window_width();
+                            let invoke_action = (ev.event_x as i32) < window_width - Self::CLOSE_BUTTON_WIDTH;
+                            // Don't mark all as read here - let callback handle individual closes
+                            on_press(unread, clicked_idx, invoke_action);
+                        }
+                        _ => {}
+                    }
+                    event_opt = self.connection.poll_for_event()?;
+                }
             }
         }
     }
@@ -251,6 +307,8 @@ impl X11 {
 pub struct X11Window {
     /// Window ID.
     pub id: u32,
+    /// Cairo surface for drawing.
+    pub surface: XCBSurface,
     /// Graphics renderer context.
     pub cairo_context: CairoContext,
     /// Text renderer context.
@@ -269,6 +327,10 @@ pub struct X11Window {
     pub screen_width: u16,
     /// Screen height in pixels.
     pub screen_height: u16,
+    /// Entry bounds for click detection: (y_start, y_end, index in original notifications vec)
+    pub entry_bounds: std::sync::Mutex<Vec<(i32, i32, usize)>>,
+    /// Current window width (updated during draw)
+    pub current_width: std::sync::Mutex<i32>,
 }
 
 unsafe impl Send for X11Window {}
@@ -279,6 +341,7 @@ impl X11Window {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u32,
+        surface: XCBSurface,
         cairo_context: CairoContext,
         font: &str,
         raw_template: &'static str,
@@ -312,6 +375,7 @@ impl X11Window {
         );
         Ok(Self {
             id,
+            surface,
             cairo_context,
             pango_context,
             layout,
@@ -321,7 +385,27 @@ impl X11Window {
             offset_y,
             screen_width,
             screen_height,
+            entry_bounds: std::sync::Mutex::new(Vec::new()),
+            current_width: std::sync::Mutex::new(0),
         })
+    }
+
+    /// Returns the index of the clicked notification based on y coordinate.
+    /// Returns None if click was on a separator or outside notification bounds.
+    pub fn get_clicked_index(&self, y: i32) -> Option<usize> {
+        if let Ok(bounds) = self.entry_bounds.lock() {
+            for (y_start, y_end, idx) in bounds.iter() {
+                if y >= *y_start && y < *y_end {
+                    return Some(*idx);
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the current window width.
+    pub fn get_window_width(&self) -> i32 {
+        self.current_width.lock().map(|w| *w).unwrap_or(0)
     }
 
     /// Calculates the X,Y position based on origin, offsets, and window size.
@@ -353,6 +437,15 @@ impl X11Window {
         Ok(())
     }
 
+    /// Escapes text for safe inclusion in Pango markup.
+    fn escape_markup(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+    }
+
     /// Draws the window content with multiple notifications.
     fn draw(
         &self,
@@ -365,47 +458,144 @@ impl X11Window {
             return Ok(());
         }
 
-        // Render each notification and join with newlines
-        let mut messages = Vec::new();
-        for notification in &notifications {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Set layout width for text wrapping
+        let wrap_width = config.global.min_width.unwrap_or(600) as i32;
+        self.layout.set_width(wrap_width * pango::SCALE);
+        self.layout.set_wrap(pango::WrapMode::WordChar);
+
+        // Reverse to show newest first
+        let mut notifications_reversed: Vec<_> = notifications.iter().collect();
+        notifications_reversed.reverse();
+
+        // Build notification entries with their markup and background colors
+        struct NotificationEntry {
+            markup: String,
+            bg_color: Option<String>,
+            height: i32,
+            is_separator: bool,
+            /// Index in original notifications vec (None for separators and footer)
+            original_index: Option<usize>,
+        }
+
+        let separator_height = 2; // pixels
+        let mut entries: Vec<NotificationEntry> = Vec::new();
+
+        for (idx, notification) in notifications_reversed.iter().enumerate() {
             let urgency_config = config.get_urgency_config(&notification.urgency);
             urgency_config.run_commands(notification)?;
-            let message = notification.render_message(
-                &self.template,
-                urgency_config.text.clone(),
-                unread_count,
-            )?;
-            messages.push(message);
+
+            // Calculate age in seconds
+            let age_secs = now.saturating_sub(notification.timestamp);
+
+            // Check for matching rule first, then app_colors, then default
+            let matching_rule = config.get_matching_rule(
+                &notification.app_name,
+                &notification.summary,
+                &notification.body,
+            );
+
+            // Get background color from rule or app_colors
+            let bg_color = matching_rule
+                .and_then(|r| r.background.as_ref())
+                .or_else(|| config.get_app_color(&notification.app_name))
+                .cloned();
+
+            // Format age display
+            let age_display = if age_secs < 60 {
+                format!("{:>3}s", age_secs)
+            } else if age_secs < 3600 {
+                format!("{:>3}m", age_secs / 60)
+            } else {
+                format!("{:>3}h", age_secs / 3600)
+            };
+
+            // Escape text for Pango markup (preserve newlines in body)
+            let app_name_escaped = Self::escape_markup(&notification.app_name);
+            let summary_escaped = Self::escape_markup(&notification.summary);
+            let body_escaped = Self::escape_markup(&notification.body);
+
+            // Build the notification line with Pango markup (no background attr)
+            let markup = format!(
+                "<tt><span foreground=\"#888888\">{}</span></tt> {} <b>{}</b>{}",
+                age_display,
+                app_name_escaped,
+                summary_escaped,
+                if notification.body.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n  {}", body_escaped)
+                }
+            );
+
+            // Calculate height for this entry
+            self.layout.set_markup(&markup);
+            let (_, height) = self.layout.pixel_size();
+
+            // Map reversed index back to original: notifications_reversed[idx] == notifications[len-1-idx]
+            let original_idx = notifications.len() - 1 - idx;
+
+            entries.push(NotificationEntry {
+                markup,
+                bg_color,
+                height,
+                is_separator: false,
+                original_index: Some(original_idx),
+            });
+
+            // Add separator between notifications (but not after the last one)
+            if idx < notifications_reversed.len() - 1 {
+                entries.push(NotificationEntry {
+                    markup: String::new(),
+                    bg_color: None,
+                    height: separator_height,
+                    is_separator: true,
+                    original_index: None,
+                });
+            }
         }
-        let combined_message = messages.join("\n");
 
-        // Use the urgency of the most recent notification for colors
-        let last_notification = notifications.last().expect("notifications not empty");
-        let urgency_config = config.get_urgency_config(&last_notification.urgency);
+        // Add unread count if more than displayed
+        if unread_count > notifications.len() {
+            let more_markup = format!(
+                "<span foreground=\"#888888\"><i>... and {} more</i></span>",
+                unread_count - notifications.len()
+            );
+            self.layout.set_markup(&more_markup);
+            let (_, height) = self.layout.pixel_size();
+            entries.push(NotificationEntry {
+                markup: more_markup,
+                bg_color: None,
+                height,
+                is_separator: false,
+                original_index: None,
+            });
+        }
 
-        let background_color = urgency_config.background;
-        self.cairo_context.set_source_rgba(
-            background_color.red() / 255.0,
-            background_color.green() / 255.0,
-            background_color.blue() / 255.0,
-            background_color.alpha(),
-        );
-        self.cairo_context.fill()?;
-        self.cairo_context.paint()?;
-        let foreground_color = urgency_config.foreground;
-        self.cairo_context.set_source_rgba(
-            foreground_color.red() / 255.0,
-            foreground_color.green() / 255.0,
-            foreground_color.blue() / 255.0,
-            foreground_color.alpha(),
-        );
-        self.cairo_context.move_to(0., 0.);
-        self.layout.set_markup(&combined_message);
+        // Calculate total height
+        let total_height: i32 = entries.iter().map(|e| e.height).sum();
+
+        // Use the urgency of the most recent notification for default background color
+        let newest_notification = notifications_reversed
+            .first()
+            .expect("notifications not empty");
+        let urgency_config = config.get_urgency_config(&newest_notification.urgency);
+
+        // Calculate window dimensions
+        let width_u32 = wrap_width as u32;
+        let height_u32 = total_height.max(1) as u32;
+
+        // Store current width for click detection
+        if let Ok(mut w) = self.current_width.lock() {
+            *w = wrap_width;
+        }
+
+        // Calculate and apply window size if wrap_content is enabled
         if config.global.wrap_content {
-            let (width, height) = self.layout.pixel_size();
-            let width_u32 = width.max(0) as u32;
-            let height_u32 = height.max(0) as u32;
-
             // Calculate new position based on origin and new size
             let (x, y) = calculate_position_from_origin(
                 self.origin,
@@ -421,11 +611,108 @@ impl X11Window {
             let values = ConfigureWindowAux::default()
                 .x(Some(x.into()))
                 .y(Some(y.into()))
-                .width(width.try_into().ok())
-                .height(height.try_into().ok());
+                .width(Some(width_u32))
+                .height(Some(height_u32));
             connection.configure_window(self.id, &values)?;
+
+            // Resize the cairo surface to match the new window size
+            self.surface.set_size(width_u32 as i32, height_u32 as i32)?;
         }
-        pango_functions::show_layout(&self.cairo_context, &self.layout);
+
+        // Clear the entire surface with default background color
+        let background_color = urgency_config.background;
+        self.cairo_context.set_source_rgba(
+            background_color.red() / 255.0,
+            background_color.green() / 255.0,
+            background_color.blue() / 255.0,
+            background_color.alpha(),
+        );
+        self.cairo_context.paint()?;
+
+        // Draw each entry with its background and text
+        let foreground_color = urgency_config.foreground;
+        let mut y_pos = 0.0_f64;
+
+        // Clear and rebuild entry bounds for click detection
+        let mut new_bounds = Vec::new();
+
+        for entry in &entries {
+            let y_start = y_pos as i32;
+            let y_end = (y_pos + entry.height as f64) as i32;
+
+            if entry.is_separator {
+                // Draw separator as a horizontal line
+                self.cairo_context.set_source_rgba(0.27, 0.27, 0.27, 1.0); // #444444
+                self.cairo_context
+                    .rectangle(0.0, y_pos, width_u32 as f64, entry.height as f64);
+                self.cairo_context.fill()?;
+            } else {
+                // Track bounds for notification entries (not footer)
+                if let Some(idx) = entry.original_index {
+                    new_bounds.push((y_start, y_end, idx));
+                }
+
+                // Draw background rectangle if this entry has a custom color
+                if let Some(ref color) = entry.bg_color
+                    && let Ok(rgb) = colorsys::Rgb::from_hex_str(color)
+                {
+                    self.cairo_context.set_source_rgba(
+                        rgb.red() / 255.0,
+                        rgb.green() / 255.0,
+                        rgb.blue() / 255.0,
+                        1.0,
+                    );
+                    self.cairo_context
+                        .rectangle(0.0, y_pos, width_u32 as f64, entry.height as f64);
+                    self.cairo_context.fill()?;
+                }
+
+                // Draw the text
+                self.cairo_context.set_source_rgba(
+                    foreground_color.red() / 255.0,
+                    foreground_color.green() / 255.0,
+                    foreground_color.blue() / 255.0,
+                    foreground_color.alpha(),
+                );
+                self.cairo_context.move_to(0., y_pos);
+                self.layout.set_markup(&entry.markup);
+                pango_functions::show_layout(&self.cairo_context, &self.layout);
+
+                // Draw close button (×) on the right side for notification entries
+                if entry.original_index.is_some() {
+                    let close_btn_width = 30.0_f64;
+                    let close_x = width_u32 as f64 - close_btn_width;
+                    let center_y = y_pos + (entry.height as f64 / 2.0);
+
+                    // Draw subtle background for close button
+                    self.cairo_context.set_source_rgba(0.3, 0.3, 0.3, 0.5);
+                    self.cairo_context
+                        .rectangle(close_x, y_pos, close_btn_width, entry.height as f64);
+                    self.cairo_context.fill()?;
+
+                    // Draw × symbol
+                    self.cairo_context.set_source_rgba(0.7, 0.7, 0.7, 1.0);
+                    self.layout.set_markup("<b>×</b>");
+                    let (text_w, text_h) = self.layout.pixel_size();
+                    self.cairo_context.move_to(
+                        close_x + (close_btn_width - text_w as f64) / 2.0,
+                        center_y - (text_h as f64 / 2.0),
+                    );
+                    pango_functions::show_layout(&self.cairo_context, &self.layout);
+                }
+            }
+
+            y_pos += entry.height as f64;
+        }
+
+        // Store bounds for click detection
+        if let Ok(mut bounds) = self.entry_bounds.lock() {
+            *bounds = new_bounds;
+        }
+
+        // Flush the surface to ensure changes are visible
+        self.surface.flush();
+
         Ok(())
     }
 }

@@ -41,20 +41,24 @@ impl Notifications {
 
     /// Returns the server's capabilities.
     async fn get_capabilities(&self) -> fdo::Result<Vec<String>> {
-        Ok(vec!["body".to_string(), "body-markup".to_string()])
+        Ok(vec![
+            "body".to_string(),
+            "body-markup".to_string(),
+            "actions".to_string(),
+        ])
     }
 
     /// Called when an external program sends a notification request.
     async fn notify(
         &self,
-        app_name: String,  // Name of the app sending the notification
-        replaces_id: u32,  // ID of notification to replace, if any
-        _app_icon: String, // Icon field
-        summary: String,   // Title of the notification
-        body: String,      // Body text
-        _actions: Vec<String>,
+        app_name: String,     // Name of the app sending the notification
+        replaces_id: u32,     // ID of notification to replace, if any
+        _app_icon: String,    // Icon field
+        summary: String,      // Title of the notification
+        body: String,         // Body text
+        actions: Vec<String>, // Action keys and labels
         hints: HashMap<String, zbus::zvariant::Value<'_>>, // Extra metadata
-        expire_timeout: i32,                               // Time before it disappears
+        expire_timeout: i32,  // Time before it disappears
     ) -> fdo::Result<u32> {
         // Generate or reuse a notification ID.
         let id = if replaces_id > 0 {
@@ -98,6 +102,7 @@ impl Notifications {
             urgency,
             is_read: false,
             timestamp,
+            actions,
         };
 
         // Send the notification to the main thread for display.

@@ -60,6 +60,9 @@ pub struct Notification {
     pub is_read: bool,
     /// Timestamp that the notification is created.
     pub timestamp: u64,
+    /// Actions available for this notification (key-label pairs flattened).
+    /// Format: [key1, label1, key2, label2, ...]
+    pub actions: Vec<String>,
 }
 
 impl Notification {
@@ -161,6 +164,8 @@ pub enum Action {
     Close(Option<u32>),
     /// Close all the notifications.
     CloseAll,
+    /// Invoke an action on a notification (id, action_key).
+    Invoke(u32, String),
 }
 
 /// Notification manager.
@@ -202,14 +207,10 @@ impl Manager {
             .push(notification);
     }
 
-    /// Returns the last unread notification.
-    pub fn get_last_unread(&self) -> Notification {
+    /// Returns the last unread notification, if any.
+    pub fn get_last_unread(&self) -> Option<Notification> {
         let notifications = self.inner.read().expect("failed to retrieve notifications");
-        let notifications = notifications
-            .iter()
-            .filter(|v| !v.is_read)
-            .collect::<Vec<&Notification>>();
-        notifications[notifications.len() - 1].clone()
+        notifications.iter().rfind(|v| !v.is_read).cloned()
     }
 
     /// Marks the last notification as read.

@@ -1,9 +1,17 @@
 [global]
     log_verbosity = "info"
     startup_notification = true
-    geometry = "340x25+0+0"
+    geometry = "500x25+10+10"
     wrap_content = true
-    font = "Monospace 10"
+    font = "Monospace 15"
+    # Minimum window width in pixels (optional)
+    min_width = 500
+    # Refresh interval in ms for age counter (0 to disable, default 1000)
+    refresh_interval_ms = 1000
+    # Display limit - max notifications shown at once (0 for unlimited)
+    display_limit = 5
+    # Template is no longer used for multi-notification display
+    # but kept for backward compatibility
     template = """
     [{{app_name}}] <b>{{summary}}</b>\
     {% if body %} {{body}}{% endif %} \
@@ -14,20 +22,43 @@
     """
 
 [urgency_low]
-    background = "#000000"
-    foreground = "#505050"
-    timeout = 2
+    background = "#222222"
+    foreground = "#888888"
+    timeout = 40
     text = "low"
 
 [urgency_normal]
-    background = "#bcbcb2"
-    foreground = "#3f3c35"
-    timeout = 10
+    background = "#1a1a1a"
+    foreground = "#e0e0e0"
+    timeout = 40
     auto_clear = true
     text = "normal"
 
 [urgency_critical]
-    background = "#3f3c35"
-    foreground = "#bcbcb2"
+    background = "#900000"
+    foreground = "#ffffff"
     timeout = 0
     text = "critical"
+
+# App-specific colors (supports glob patterns with *)
+# app_name = "hex_color"
+[app_colors]
+    firefox = "#ff6611"
+    slack = "#4a154b"
+    discord = "#5865f2"
+    notify-send = "#888888"
+    runst = "#00aa00"
+
+# Rules for styling notifications based on patterns
+# Each rule can match on app_name, summary, and/or body using glob patterns (*)
+# First matching rule wins
+
+# Claude Code notifications - light green
+[[rules]]
+    summary = "Claude*"
+    foreground = "#90ee90"
+
+# Bash command completion - light purple
+[[rules]]
+    summary = "Bash*"
+    foreground = "#d8bfd8"
