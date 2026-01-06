@@ -285,6 +285,52 @@ impl Manager {
             .map(|v| !v.is_read)
             .unwrap_or_default()
     }
+
+    /// Returns the last N unread notifications (oldest first).
+    /// If limit is 0, returns all unread notifications.
+    pub fn get_unread_buffer(&self, limit: usize) -> Vec<Notification> {
+        let notifications = self.inner.read().expect("failed to retrieve notifications");
+        let unread: Vec<Notification> = notifications
+            .iter()
+            .filter(|v| !v.is_read)
+            .cloned()
+            .collect();
+        if limit == 0 || unread.len() <= limit {
+            unread
+        } else {
+            // Return the most recent `limit` notifications
+            let skip_count = unread.len() - limit;
+            unread.into_iter().skip(skip_count).collect()
+        }
+    }
+
+    /// Enforces the display limit by marking oldest unread notifications as read.
+    /// Returns the IDs of notifications that were marked as read.
+    pub fn enforce_limit(&self, limit: usize) -> Vec<u32> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut notifications = self
+            .inner
+            .write()
+            .expect("failed to retrieve notifications");
+        let unread_indices: Vec<usize> = notifications
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| !v.is_read)
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut evicted_ids = Vec::new();
+        if unread_indices.len() > limit {
+            let to_evict = unread_indices.len() - limit;
+            for &idx in unread_indices.iter().take(to_evict) {
+                notifications[idx].is_read = true;
+                evicted_ids.push(notifications[idx].id);
+            }
+        }
+        evicted_ids
+    }
 }
 #[cfg(test)]
 mod tests {

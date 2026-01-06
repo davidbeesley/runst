@@ -1,12 +1,14 @@
 use crate::error::{Error, Result};
 use crate::notification::{Notification, NotificationFilter, Urgency};
 use colorsys::Rgb;
+use log::LevelFilter;
 use rust_embed::RustEmbed;
 use serde::de::{Deserializer, Error as SerdeError};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use sscanf::scanf;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -14,7 +16,45 @@ use std::result::Result as StdResult;
 use std::str::{self, FromStr};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tera::Tera;
-use tracing::Level;
+
+/// Window origin/anchor point for positioning.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Origin {
+    /// Anchor to top-left corner (default).
+    #[default]
+    TopLeft,
+    /// Anchor to top-right corner.
+    TopRight,
+    /// Anchor to bottom-left corner.
+    BottomLeft,
+    /// Anchor to bottom-right corner.
+    BottomRight,
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TopLeft => write!(f, "top-left"),
+            Self::TopRight => write!(f, "top-right"),
+            Self::BottomLeft => write!(f, "bottom-left"),
+            Self::BottomRight => write!(f, "bottom-right"),
+        }
+    }
+}
+
+impl FromStr for Origin {
+    type Err = Error;
+    fn from_str(s: &str) -> StdResult<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "top-left" | "topleft" => Ok(Self::TopLeft),
+            "top-right" | "topright" => Ok(Self::TopRight),
+            "bottom-left" | "bottomleft" => Ok(Self::BottomLeft),
+            "bottom-right" | "bottomright" => Ok(Self::BottomRight),
+            _ => Err(Error::Config(format!("invalid origin: {}", s))),
+        }
+    }
+}
 
 /// Environment variable for the configuration file.
 const CONFIG_ENV: &str = "RUNST_CONFIG";
@@ -85,27 +125,36 @@ impl Config {
 pub struct GlobalConfig {
     /// Log verbosity.
     #[serde(deserialize_with = "deserialize_level_from_string", skip_serializing)]
-    pub log_verbosity: Level,
+    pub log_verbosity: LevelFilter,
     /// Whether if a startup notification should be shown.
     pub startup_notification: bool,
     /// Geometry of the notification window.
     #[serde(deserialize_with = "deserialize_geometry_from_string")]
     pub geometry: Geometry,
+    /// Window origin/anchor point (top-left, top-right, bottom-left, bottom-right).
+    /// The geometry x,y become offsets from this origin.
+    #[serde(default)]
+    pub origin: Origin,
     /// Whether if the window will be resized to wrap the content.
     pub wrap_content: bool,
     /// Text font.
     pub font: String,
     /// Template for the notification message.
     pub template: String,
+    /// Maximum number of notifications to display at once (ring buffer).
+    /// When exceeded, oldest notifications are automatically dismissed.
+    /// Set to 0 for unlimited.
+    #[serde(default)]
+    pub display_limit: usize,
 }
 
-/// Custom deserializer implementation for converting `String` to [`Level`]
-fn deserialize_level_from_string<'de, D>(deserializer: D) -> StdResult<Level, D::Error>
+/// Custom deserializer implementation for converting `String` to [`LevelFilter`]
+fn deserialize_level_from_string<'de, D>(deserializer: D) -> StdResult<LevelFilter, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value: String = Deserialize::deserialize(deserializer)?;
-    Level::from_str(&value).map_err(SerdeError::custom)
+    LevelFilter::from_str(&value).map_err(SerdeError::custom)
 }
 
 /// Custom deserializer implementation for converting `String` to [`Geometry`]
@@ -191,10 +240,10 @@ impl UrgencyConfig {
     pub fn run_commands(&self, notification: &Notification) -> Result<()> {
         if let Some(commands) = &self.custom_commands {
             for command in commands {
-                if let Some(filter) = &command.filter {
-                    if !notification.matches_filter(filter) {
-                        continue;
-                    }
+                if let Some(filter) = &command.filter
+                    && !notification.matches_filter(filter)
+                {
+                    continue;
                 }
                 if (notification.timestamp
                     + notification.expire_timeout.unwrap_or_default().as_secs())
@@ -202,7 +251,7 @@ impl UrgencyConfig {
                 {
                     continue;
                 }
-                tracing::trace!("running command: {:#?}", command);
+                log::trace!("running command: {:#?}", command);
                 let command = Tera::one_off(
                     &command.command,
                     &notification.into_context(

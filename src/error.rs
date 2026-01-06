@@ -44,6 +44,8 @@ pub enum Error {
     Config(String),
     #[error("Init error: `{0}")]
     Init(String),
+    #[error("JSON error: `{0}`")]
+    Json(#[from] serde_json::Error),
 }
 
 /// Type alias for the standard [`Result`] type.

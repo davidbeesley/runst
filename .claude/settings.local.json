@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__cupel__list_project_structure",
+      "Bash(cargo check:*)",
+      "Bash(cargo clippy:*)"
+    ]
+  }
+}

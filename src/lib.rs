@@ -17,31 +17,40 @@ pub mod config;
 /// Notification manager.
 pub mod notification;
 
+/// Command-line interface.
+pub mod cli;
+
+/// Persistent notification history.
+pub mod history;
+
 use crate::config::Config;
 use crate::error::Result;
+use crate::history::{DEFAULT_HISTORY_LIMIT, History, HistoryEntry};
 use crate::notification::Action;
 use crate::x11::X11;
 use estimated_read_time::Options;
+use log::{debug, info, trace};
 use notification::{Manager, Notification, Urgency};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing_subscriber::EnvFilter;
 
 /// Runs `runst`.
 pub fn run() -> Result<()> {
     let config = Arc::new(Config::parse()?);
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_default_directive(config.global.log_verbosity.into())
-                .from_env_lossy(),
-        )
-        .init();
-    tracing::trace!("{:#?}", config);
-    tracing::info!("starting runst with zbus");
+    // Initialize core-log with the configured log level
+    core_log::CoreLogger::init_with_filter(config.global.log_verbosity);
+    trace!("{:#?}", config);
+    info!("starting runst with zbus");
+
+    // Initialize history storage
+    let history = Arc::new(Mutex::new(History::new(DEFAULT_HISTORY_LIMIT)?));
+    info!(
+        "history storage initialized with {} entries",
+        history.lock().expect("history lock").len()
+    );
 
     let mut x11 = X11::init(None)?;
     let window = x11.create_window(&config.global)?;
@@ -65,7 +74,7 @@ pub fn run() -> Result<()> {
             notifications_cloned,
             config_cloned,
             move |notification| {
-                tracing::debug!("user input detected");
+                debug!("user input detected");
                 sender_cloned
                     .send(Action::Close(Some(notification.id)))
                     .expect("failed to send close action");
@@ -78,7 +87,7 @@ pub fn run() -> Result<()> {
     // Spawn zbus D-Bus server thread
     let sender_for_zbus = sender.clone();
     thread::spawn(move || {
-        tracing::debug!("starting Z-Bus server thread");
+        debug!("starting Z-Bus server thread");
 
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async {
@@ -119,7 +128,7 @@ pub fn run() -> Result<()> {
                                 return;
                             }
 
-                            tracing::info!("Z-Bus server is running");
+                            info!("Z-Bus server is running");
                             // Keep the connection alive
                             std::future::pending::<()>().await;
                         }
@@ -159,7 +168,25 @@ pub fn run() -> Result<()> {
     loop {
         match receiver.recv()? {
             Action::Show(notification) => {
-                tracing::debug!("received notification: {}", notification.id);
+                debug!("received notification: {}", notification.id);
+
+                // Save to persistent history
+                {
+                    let entry = HistoryEntry::new(
+                        notification.id,
+                        notification.app_name.clone(),
+                        notification.summary.clone(),
+                        notification.body.clone(),
+                        &notification.urgency,
+                        notification.timestamp,
+                    );
+                    if let Ok(mut hist) = history.lock()
+                        && let Err(e) = hist.add(entry)
+                    {
+                        log::warn!("failed to save notification to history: {}", e);
+                    }
+                }
+
                 let timeout = notification.expire_timeout.unwrap_or_else(|| {
                     let urgency_config = config.get_urgency_config(&notification.urgency);
                     Duration::from_secs(if urgency_config.auto_clear.unwrap_or(false) {
@@ -172,7 +199,7 @@ pub fn run() -> Result<()> {
                     })
                 });
                 if !timeout.is_zero() {
-                    tracing::debug!("notification timeout: {}ms", timeout.as_millis());
+                    debug!("notification timeout: {}ms", timeout.as_millis());
                     let sender_cloned = sender.clone();
                     let notifications_cloned = notifications.clone();
                     let notification_id = notification.id;
@@ -186,11 +213,19 @@ pub fn run() -> Result<()> {
                     });
                 }
                 notifications.add(notification);
+                // Enforce display limit (ring buffer behavior)
+                let display_limit = config.global.display_limit;
+                if display_limit > 0 {
+                    let evicted = notifications.enforce_limit(display_limit);
+                    for id in evicted {
+                        debug!("evicted notification {} due to display limit", id);
+                    }
+                }
                 x11_cloned.hide_window(&window)?;
                 x11_cloned.show_window(&window)?;
             }
             Action::ShowLast => {
-                tracing::debug!("showing the last notification");
+                debug!("showing the last notification");
                 if notifications.count() == 0 {
                     continue;
                 } else if notifications.mark_next_as_unread() {
@@ -202,10 +237,10 @@ pub fn run() -> Result<()> {
             }
             Action::Close(id) => {
                 if let Some(id) = id {
-                    tracing::debug!("closing notification: {}", id);
+                    debug!("closing notification: {}", id);
                     notifications.mark_as_read(id);
                 } else {
-                    tracing::debug!("closing the last notification");
+                    debug!("closing the last notification");
                     notifications.mark_last_as_read();
                 }
                 x11_cloned.hide_window(&window)?;
@@ -214,7 +249,7 @@ pub fn run() -> Result<()> {
                 }
             }
             Action::CloseAll => {
-                tracing::debug!("closing all notifications");
+                debug!("closing all notifications");
                 notifications.mark_all_as_read();
                 x11_cloned.hide_window(&window)?;
             }
