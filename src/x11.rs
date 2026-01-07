@@ -230,6 +230,10 @@ impl X11 {
         let display_limit = config.global.display_limit;
         let refresh_interval = config.global.refresh_interval_ms;
 
+        // Use short poll interval for responsiveness, track time for redraws
+        const POLL_INTERVAL_MS: u64 = 50;
+        let mut last_redraw = std::time::Instant::now();
+
         loop {
             self.connection.flush()?;
 
@@ -243,12 +247,17 @@ impl X11 {
                 let mut event_opt = self.connection.poll_for_event()?;
 
                 if event_opt.is_none() {
-                    // No events, sleep for refresh interval then redraw
-                    std::thread::sleep(Duration::from_millis(refresh_interval));
-                    let notifications = manager.get_unread_buffer(display_limit);
-                    let unread_count = manager.get_unread_count();
-                    if !notifications.is_empty() {
-                        window.draw(&self.connection, notifications, unread_count, &config)?;
+                    // No events, short sleep for responsiveness
+                    std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+
+                    // Only redraw at refresh_interval rate
+                    if last_redraw.elapsed().as_millis() >= refresh_interval as u128 {
+                        let notifications = manager.get_unread_buffer(display_limit);
+                        let unread_count = manager.get_unread_count();
+                        if !notifications.is_empty() {
+                            window.draw(&self.connection, notifications, unread_count, &config)?;
+                        }
+                        last_redraw = std::time::Instant::now();
                     }
                     continue;
                 }
